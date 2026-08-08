@@ -1,0 +1,53 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Environments and editor state
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+
+# Logs, temporary files, and local experiment output
+*.log
+*.tmp
+*.bak*
+*.before_*
+tmp/
+tmp_eval/
+output/
+outputs/
+wandb/
+src/r1-v/eval_results/
+src/r1-v/*_debug.txt
+
+# Datasets and model checkpoints
+data/
+datasets/
+checkpoints/
+checkpoint-*/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Credentials
+*.pem
+*.key
+*credentials*
+*secret*
+
+# OS metadata
+.DS_Store
+Thumbs.db

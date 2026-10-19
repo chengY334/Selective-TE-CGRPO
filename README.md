@@ -4,7 +4,7 @@
 
 TE-CGRPO is a reinforcement-learning framework for video reasoning that coordinates **group selection, response-reward shaping, and token-loss allocation** through temporal contrast. This repository provides the **3B training implementation** with Qwen2.5-VL, including probability-based token reweighting and matched control variants.
 
-[Method](#method) | [Manuscript results](#manuscript-results) | [Quick start](#quick-start) | [Training guide](docs/TRAINING.md)
+[Method](#method) | [Quick start](#quick-start) | [Training guide](docs/TRAINING.md)
 
 ## Overview
 
@@ -63,24 +63,6 @@ where $M_{i,t}$ is the valid-completion mask and $\ell_{i,t}$ contains the polic
 | Token RW | Redistributes token-loss contributions after advantage computation | All ordered responses in positive-gap video groups |
 
 Non-selected groups are retained in training. No extra model parameters or cross-view scoring are introduced at inference time.
-
-## Manuscript results
-
-The manuscript evaluates TE-CGRPO on **VSI-Bench, MMVU, MVBench, TempCompass, and Video-MME** at 3B and 7B scales. The table below reproduces the manuscript's matched local **3B comparison at 16 evaluation frames**, using a shared SFT initialization and a common evaluation protocol.
-
-VSI-Bench reports its official Overall score; the other columns report accuracy. MMVU uses multiple-choice questions, and Video-MME excludes subtitles. Mean is the unweighted average of the five benchmark scores.
-
-| Model | VSI-Bench | MMVU | MVBench | TempCompass | Video-MME | Mean |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Qwen2.5-VL-3B-SFT | 31.82 | 56.80 | 52.98 | 62.63 | 47.26 | 50.30 |
-| Video-R1-3B, local baseline | 33.01 | 54.88 | 57.18 | 63.97 | 48.00 | 51.41 |
-| **TE-CGRPO-3B** | **34.74** | **60.48** | **57.78** | **64.12** | **49.67** | **53.36** |
-
-TE-CGRPO-3B improves the five-benchmark mean by **1.95 points** over the local baseline at 16 frames. Component ablations favor the complete configuration. Restricting Token RW to positive-gap groups also yields a higher mean than reweighting every video group at each tested 3B evaluation budget of 8, 16, and 32 frames.
-
-At 7B, the manuscript reports mean gains of **0.43** and **0.88 points** over the original March 2025 Video-R1 release at 16 and 32 evaluation frames, respectively. That comparison uses reported baseline scores and is distinct from the matched local 3B study.
-
-These are **manuscript-reported results**, not measurements from a new run of this source snapshot. This release contains the 3B training path, not a 7B launcher or the complete benchmark evaluation pipeline. Prediction records, evaluation outputs, and checkpoints are not included.
 
 ## Quick start
 

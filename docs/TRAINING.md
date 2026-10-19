@@ -1,6 +1,6 @@
 # 3B Training Guide
 
-This guide describes the source release's training entry path. The method overview is in the root [README](../README.md). Package versions and validation boundaries are in [Environment](ENVIRONMENT.md).
+This guide describes the source release's training entry path. Package versions and validation boundaries are in [Environment](ENVIRONMENT.md).
 
 ## Model and data
 

@@ -1,53 +1,84 @@
-# Python caches and build artifacts
-__pycache__/
-*.py[cod]
-*.so
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-build/
-dist/
-*.egg-info/
-
-# Environments and editor state
+# Local configuration and credentials
+/server_3b_config.local.json
+/requirements-server.txt
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+.netrc
+.git-credentials
+.ssh/
+.aws/
+.codex/
+
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
 venv/
+env/
+build/
+dist/
+.ipynb_checkpoints/
 .idea/
 .vscode/
-*.swp
+.DS_Store
+Thumbs.db
 
-# Logs, temporary files, and local experiment output
-*.log
-*.tmp
-*.bak*
-*.before_*
-tmp/
-tmp_eval/
-output/
+# Training outputs and private diagnostics
 outputs/
+output/
+runs/
+logs/
 wandb/
-src/r1-v/eval_results/
-src/r1-v/*_debug.txt
-
-# Datasets and model checkpoints
-data/
-datasets/
 checkpoints/
 checkpoint-*/
+*.log
+rw_diagnostics.rank*.jsonl
+rw_tokens.rank*.jsonl
+run_manifest.json
+environment_*.txt
+command_*.txt
+COMPLETE_*.json
+FAILED_*.json
+smoke_dataset.json
+resume_history/
+
+# Model weights and datasets are obtained separately
+*.safetensors
+*.bin
 *.pt
 *.pth
 *.ckpt
-*.safetensors
+*.onnx
+*.gguf
+*.arrow
+*.parquet
+*.pkl
+*.pickle
+*.npy
+*.npz
+/data/
+/datasets/
+/models/
+Video-R1-260k*.json
+Video-R1-260k*.jsonl
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
 
-# Credentials
-*.pem
-*.key
-*credentials*
-*secret*
-
-# OS metadata
-.DS_Store
-Thumbs.db
+# Archives and backups stay outside the public source tree
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.bak
+backups/

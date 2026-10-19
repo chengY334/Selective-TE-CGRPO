@@ -1,3 +1,5 @@
+# TE-CGRPO modifications: Soft answer scoring and explicit reward/RW controls.
+# Standalone 3B loading and smoke/export handling are included in this version.
 # Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +23,7 @@ from typing import Optional
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
 
-from trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainerModified
+from trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 from datasets import Dataset, DatasetDict
@@ -66,17 +68,24 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Enable Focused and Unhackable Temporal GRPO reward shaping."},
     )
     fut_token_weighting: Optional[bool] = field(
-        default=True,
-        metadata={"help": "Weight policy loss toward temporal-evidence tokens when FUT-GRPO is enabled."},
+        default=False,
+        metadata={"help": "Independent Token RW switch; set False for a pure baseline, even when fut_grpo=False."},
+    )
+    fut_token_weighting_method: str = field(
+        default="contrast",
+        metadata={"help": "contrast: same-completion cross-view sensitivity; lexicon: legacy weights."},
+    )
+    fut_token_sensitivity_tau: float = field(
+        default=1.0,
+        metadata={"help": "Positive sensitivity scale in natural-log units (pilot default, not tuned)."},
     )
     fut_token_weighting_scope: Optional[str] = field(
         default="selective",
         metadata={
             "help": (
-                "Temporal token-reweighting scope: 'all_video' applies it to every video group; "
-                "'positive_gap' applies it only when ordered-vs-corrupted gap g > 0; "
-                "'selective' preserves the reliable-gap rule and applies it only when the "
-                "thresholded temporal bonus is active."
+                "Token-reweighting scope: 'selective' applies it only to video groups "
+                "whose answer-score gap is positive, independently of the bonus; 'all_video' "
+                "applies it to every ordered video group. Image samples remain unweighted."
             )
         },
     )
@@ -89,19 +98,29 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Positive-gap width over which the selective temporal bonus ramps to its maximum."},
     )
     fut_gap_threshold: Optional[float] = field(
-        default=0.10,
-        metadata={"help": "Minimum ordered-vs-corrupted primary task-reward gap required to activate temporal supervision."},
+        default=0.0,
+        metadata={
+            "help": (
+                "Compatibility option fixed to 0.0 by the final objective; nonzero "
+                "values are rejected by the trainer."
+            )
+        },
     )
     fut_min_correct_reward: Optional[float] = field(
-        default=0.1,
-        metadata={"help": "Minimum primary task reward needed before temporal bonus can be applied."},
+        default=0.0,
+        metadata={
+            "help": (
+                "Compatibility option fixed to 0.0; the temporal bonus is applied "
+                "exactly when the ordered response has positive soft reward."
+            )
+        },
     )
     fut_corruptions: Optional[str] = field(
-        default="shuffle,reverse,drop_middle",
+        default="shuffle",
         metadata={"help": "Comma-separated temporal corruptions: shuffle, reverse, drop_middle, edges."},
     )
     fut_num_corruptions: Optional[int] = field(
-        default=2,
+        default=1,
         metadata={"help": "Number of temporal corruptions sampled per video prompt."},
     )
     fut_negative_generations: Optional[int] = field(
@@ -405,6 +424,13 @@ SYSTEM_PROMPT = (
 
 
 def main(script_args, training_args, model_args):
+    # Match the requested mixed precision at load time rather than loading FP32
+    # parameters unnecessarily. Explicit model_init_kwargs remain authoritative.
+    training_args.model_init_kwargs = dict(training_args.model_init_kwargs or {})
+    if training_args.bf16:
+        training_args.model_init_kwargs.setdefault("torch_dtype", "bfloat16")
+    elif training_args.fp16:
+        training_args.model_init_kwargs.setdefault("torch_dtype", "float16")
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
 
@@ -501,7 +527,13 @@ def main(script_args, training_args, model_args):
     dataset = dataset.map(make_conversation_image_and_video)
 
     
-    trainer_cls = Qwen2VLGRPOTrainer if not training_args.use_vllm else Qwen2VLGRPOVLLMTrainerModified
+    if training_args.use_vllm and script_args.fut_token_weighting and script_args.fut_token_weighting_method == "contrast":
+        raise ValueError("Contrast Token RW currently requires --use_vllm False; vLLM does not implement cross-view scoring.")
+    if training_args.use_vllm:
+        from trainer import Qwen2VLGRPOVLLMTrainerModified
+        trainer_cls = Qwen2VLGRPOVLLMTrainerModified
+    else:
+        trainer_cls = Qwen2VLGRPOTrainer
     print("using: ", trainer_cls)
 
     # Initialize the GRPO trainer
@@ -525,7 +557,11 @@ def main(script_args, training_args, model_args):
         trainer.train()
 
     # Save and push to hub
-    trainer.save_model(training_args.output_dir)
+    if os.environ.get("TE_CGRPO_SMOKE") == "1":
+        print("Smoke run finished; full model/optimizer checkpoint export is disabled.")
+    else:
+        trainer.save_model(training_args.output_dir)
+        trainer.save_state()
     if training_args.push_to_hub:
         trainer.push_to_hub(dataset_name=script_args.dataset_name)
 

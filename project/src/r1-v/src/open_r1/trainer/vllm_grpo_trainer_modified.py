@@ -312,20 +312,30 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.beta = args.beta
         self.fut_grpo = bool(getattr(script_args, "fut_grpo", False))
         self.fut_token_weighting = bool(getattr(script_args, "fut_token_weighting", True))
+        if self.fut_token_weighting and getattr(script_args, "fut_token_weighting_method", "contrast") == "contrast":
+            raise ValueError("Contrast Token RW requires the non-vLLM trainer (--use_vllm False).")
         self.fut_token_weighting_scope = str(
             getattr(script_args, "fut_token_weighting_scope", "selective")
-        ).strip().lower()
-        valid_token_weighting_scopes = {"all_video", "positive_gap", "selective"}
-        if self.fut_token_weighting_scope not in valid_token_weighting_scopes:
+        ).strip().lower().replace("-", "_")
+        if self.fut_token_weighting_scope not in {"selective", "all_video"}:
             raise ValueError(
-                "fut_token_weighting_scope must be one of "
-                f"{sorted(valid_token_weighting_scopes)}, got "
-                f"{self.fut_token_weighting_scope!r}"
+                "fut_token_weighting_scope must be 'selective' or 'all_video', "
+                f"got {self.fut_token_weighting_scope!r}"
             )
         self.fut_temporal_alpha = float(getattr(script_args, "fut_temporal_alpha", 0.3))
         self.fut_temporal_margin = float(getattr(script_args, "fut_temporal_margin", 0.15))
-        self.fut_gap_threshold = float(getattr(script_args, "fut_gap_threshold", 0.10))
-        self.fut_min_correct_reward = float(getattr(script_args, "fut_min_correct_reward", 0.1))
+        self.fut_gap_threshold = float(getattr(script_args, "fut_gap_threshold", 0.0))
+        self.fut_min_correct_reward = float(getattr(script_args, "fut_min_correct_reward", 0.0))
+        if abs(self.fut_gap_threshold) > 1e-12:
+            raise ValueError(
+                "The final TE objective fixes fut_gap_threshold=0.0 so that "
+                "b_TE = alpha * clip(g / margin, 0, 1)."
+            )
+        if abs(self.fut_min_correct_reward) > 1e-12:
+            raise ValueError(
+                "The final TE objective fixes fut_min_correct_reward=0.0 so that "
+                "every ordered response with r_soft > 0 is eligible."
+            )
         self.fut_corruptions = getattr(script_args, "fut_corruptions", "shuffle,reverse,drop_middle")
         self.fut_num_corruptions = int(getattr(script_args, "fut_num_corruptions", 2))
         self.fut_negative_generations = int(getattr(script_args, "fut_negative_generations", 0))
@@ -960,13 +970,14 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
             if self.fut_grpo:
                 temporal_gap = acc_mean - corrupted_acc_mean
-                effective_gap = temporal_gap - self.fut_gap_threshold
                 if self.fut_temporal_margin > 0:
-                    bonus_scale = torch.clamp(effective_gap / self.fut_temporal_margin, min=0.0, max=1.0)
+                    bonus_scale = torch.clamp(
+                        temporal_gap / self.fut_temporal_margin, min=0.0, max=1.0
+                    )
                 else:
-                    bonus_scale = (effective_gap > 0).to(acc_mean.dtype)
+                    bonus_scale = (temporal_gap > 0).to(acc_mean.dtype)
                 temporal_bonus = self.fut_temporal_alpha * bonus_scale
-                mask = temporal_rewards_per_func[:, 0] > self.fut_min_correct_reward
+                mask = temporal_rewards_per_func[:, 0] > 0.0
                 temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + temporal_bonus
                 temporal_rewards = temporal_bonus.detach().reshape(1).to(device)
                 self._metrics["fut/corrupted_accuracy"].append(corrupted_acc_mean.detach().item())
@@ -1028,16 +1039,16 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         # per_token_loss = -per_token_loss
-        token_weighting_active = False
-        if self.fut_grpo and self.fut_token_weighting and bool(video_inputs):
-            if self.fut_token_weighting_scope == "all_video":
-                token_weighting_active = True
-            elif self.fut_token_weighting_scope == "positive_gap":
-                token_weighting_active = temporal_gap.detach().item() > 0.0
-            else:  # selective: preserve the reliable-gap activation used by the full method.
-                token_weighting_active = temporal_bonus.detach().item() > 0.0
-
-        if token_weighting_active:
+        apply_token_weighting = (
+            self.fut_grpo
+            and self.fut_token_weighting
+            and bool(video_inputs)
+            and (
+                self.fut_token_weighting_scope == "all_video"
+                or temporal_bonus.detach().item() > 0.0
+            )
+        )
+        if apply_token_weighting:
             token_weights = self._temporal_evidence_token_weights(completion_ids, completion_mask)
             weighted_mask = completion_mask * token_weights
             loss = ((per_token_loss * weighted_mask).sum(dim=1) / weighted_mask.sum(dim=1).clamp_min(1.0)).mean()
@@ -1048,11 +1059,10 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 mean_token_weight = completion_mask.new_tensor(1.0, dtype=torch.float32)
 
         # Every distributed rank must execute collectives in the same order.
-        # Selective activation is intentionally rank-local because each rank can
-        # receive a different modality/gap, so gather the active or neutral
-        # weight unconditionally after the branch.
+        # Token-weight activation is intentionally rank-local because each rank
+        # can receive a different modality/gap. Gather the active or neutral
+        # weight unconditionally after the branch for either scope.
         if self.fut_grpo and self.fut_token_weighting:
-            self._metrics["fut/token_weighting_activation"].append(float(token_weighting_active))
             self._metrics["fut/token_weight"].append(
                 self.accelerator.gather_for_metrics(mean_token_weight).float().mean().item()
             )

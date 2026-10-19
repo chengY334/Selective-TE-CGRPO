@@ -1,3 +1,5 @@
+# Video-R1 sampling modifications are retained in this TE-CGRPO distribution:
+# at most 16 sampled frames, with the local video pixel limits below.
 from __future__ import annotations
 
 import base64
@@ -250,49 +252,7 @@ def _read_video_decord(
     logger.info(f"decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    try:
-        video = vr.get_batch(idx).asnumpy()
-    except Exception as first_error:
-        try:
-            fps_trim = max(1, int(round(float(video_fps))))
-        except Exception:
-            fps_trim = 30
-
-        tail_trims = sorted(set([
-            1,
-            max(2, fps_trim // 4),
-            max(4, fps_trim // 2),
-            fps_trim,
-            2 * fps_trim,
-            4 * fps_trim,
-            8 * fps_trim,
-        ]))
-
-        video = None
-        for tail_trim in tail_trims:
-            safe_last = total_frames - 1 - tail_trim
-            if safe_last <= 0:
-                break
-
-            retry_idx = (
-                torch.linspace(0, safe_last, nframes)
-                .round()
-                .long()
-                .tolist()
-            )
-
-            try:
-                video = vr.get_batch(retry_idx).asnumpy()
-                logger.warning(
-                    f"decord recovered by trimming {tail_trim} tail frames: "
-                    f"{video_path}"
-                )
-                break
-            except Exception:
-                continue
-
-        if video is None:
-            raise first_error
+    video = vr.get_batch(idx).asnumpy()
     video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
     return video, sample_fps
@@ -324,11 +284,6 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         try:
             video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
         except Exception as e:
-            if (
-                video_reader_backend == "decord"
-                and os.getenv("QWEN_VL_DISABLE_TORCHVISION_FALLBACK", "0") == "1"
-            ):
-                raise
             logger.warning(f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
             video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
 

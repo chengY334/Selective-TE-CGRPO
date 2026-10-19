@@ -1,3 +1,5 @@
+# TE-CGRPO modifications: bounded temporal rewards, fixed-prefix contrast
+# weights, selective weighted loss aggregation, and per-rank diagnostics.
 # Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +19,8 @@ import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 import random
+import math
+import json
 
 import torch
 import torch.utils.data
@@ -341,25 +345,44 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.len_control = script_args.len_control
         self.beta = args.beta
         self.fut_grpo = bool(getattr(script_args, "fut_grpo", False))
-        self.fut_token_weighting = bool(getattr(script_args, "fut_token_weighting", True))
+        self.fut_token_weighting = bool(getattr(script_args, "fut_token_weighting", False))
+        self.fut_token_weighting_method = getattr(script_args, "fut_token_weighting_method", "contrast")
+        self.fut_token_sensitivity_tau = float(getattr(script_args, "fut_token_sensitivity_tau", 1.0))
+        if self.fut_token_weighting_method not in {"contrast", "lexicon"}:
+            raise ValueError("fut_token_weighting_method must be contrast or lexicon")
+        if not math.isfinite(self.fut_token_sensitivity_tau) or self.fut_token_sensitivity_tau <= 0:
+            raise ValueError("fut_token_sensitivity_tau must be finite and positive")
         self.fut_token_weighting_scope = str(
             getattr(script_args, "fut_token_weighting_scope", "selective")
-        ).strip().lower()
-        valid_token_weighting_scopes = {"all_video", "positive_gap", "selective"}
-        if self.fut_token_weighting_scope not in valid_token_weighting_scopes:
+        ).strip().lower().replace("-", "_")
+        if self.fut_token_weighting_scope not in {"selective", "all_video"}:
             raise ValueError(
-                "fut_token_weighting_scope must be one of "
-                f"{sorted(valid_token_weighting_scopes)}, got "
-                f"{self.fut_token_weighting_scope!r}"
+                "fut_token_weighting_scope must be 'selective' or 'all_video', "
+                f"got {self.fut_token_weighting_scope!r}"
             )
         self.fut_temporal_alpha = float(getattr(script_args, "fut_temporal_alpha", 0.3))
         self.fut_temporal_margin = float(getattr(script_args, "fut_temporal_margin", 0.15))
-        self.fut_gap_threshold = float(getattr(script_args, "fut_gap_threshold", 0.10))
-        self.fut_min_correct_reward = float(getattr(script_args, "fut_min_correct_reward", 0.1))
-        self.fut_corruptions = getattr(script_args, "fut_corruptions", "shuffle,reverse,drop_middle")
-        self.fut_num_corruptions = int(getattr(script_args, "fut_num_corruptions", 2))
+        self.fut_gap_threshold = float(getattr(script_args, "fut_gap_threshold", 0.0))
+        self.fut_min_correct_reward = float(getattr(script_args, "fut_min_correct_reward", 0.0))
+        if abs(self.fut_gap_threshold) > 1e-12:
+            raise ValueError(
+                "The final TE objective fixes fut_gap_threshold=0.0 so that "
+                "b_TE = alpha * clip(g / margin, 0, 1)."
+            )
+        if abs(self.fut_min_correct_reward) > 1e-12:
+            raise ValueError(
+                "The final TE objective fixes fut_min_correct_reward=0.0 so that "
+                "every ordered response with r_soft > 0 is eligible."
+            )
+        self.fut_corruptions = getattr(script_args, "fut_corruptions", "shuffle")
+        self.fut_num_corruptions = int(getattr(script_args, "fut_num_corruptions", 1))
         self.fut_negative_generations = int(getattr(script_args, "fut_negative_generations", 0))
         self.fut_token_max_weight = float(getattr(script_args, "fut_token_max_weight", 1.30))
+        if not math.isfinite(self.fut_token_max_weight) or self.fut_token_max_weight < 1:
+            raise ValueError("fut_token_max_weight must be finite and >= 1")
+        if self.fut_token_weighting and self.fut_token_weighting_method == "contrast":
+            if self._selected_corruption_names() != ["shuffle"]:
+                raise ValueError("Contrast RW requires --fut_corruptions shuffle --fut_num_corruptions 1")
         self.fut_context_weight = float(getattr(script_args, "fut_context_weight", 1.15))
         self.fut_template_min_weight = float(getattr(script_args, "fut_template_min_weight", 0.95))
         self.fut_corrupted_generation_config = GenerationConfig(
@@ -428,7 +451,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
         per_token_logps = []
         for logits_row, input_ids_row in zip(logits, input_ids):
-            log_probs = logits_row.log_softmax(dim=-1)
+            log_probs = logits_row.float().log_softmax(dim=-1)
             token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
             per_token_logps.append(token_log_prob)
         return torch.stack(per_token_logps)
@@ -505,6 +528,109 @@ class Qwen2VLGRPOTrainer(Trainer):
             corrupted_views.append((corruption_name, corrupted_video_inputs))
         return corrupted_views
 
+    @torch.no_grad()
+    def _score_fixed_completions(self, model, view_inputs, completion_ids, completion_mask):
+        """Score generated A under one view; never call generate or use reference answers.
+
+        One prompt per device is required by this trainer's video packing. Scoring
+        rows separately avoids replicating flattened video patches G times.
+        """
+        if view_inputs["input_ids"].shape[0] != 1:
+            raise ValueError("Cross-view scoring supports one prompt per device")
+        prefix = view_inputs["input_ids"]
+        prefix_mask = view_inputs["attention_mask"]
+        media = {k: v for k, v in view_inputs.items()
+                 if k not in {"input_ids", "attention_mask", "second_per_grid_ts"}}
+        scores = []
+        for ids, mask in zip(completion_ids, completion_mask):
+            full_ids = torch.cat((prefix, ids.unsqueeze(0)), dim=1)
+            attention = torch.cat((prefix_mask, mask.unsqueeze(0)), dim=1)
+            logps = self._get_per_token_logps(
+                model, full_ids, attention_mask=attention, use_cache=False, **media
+            )
+            scores.append(logps[:, prefix.shape[1] - 1:])
+        return torch.cat(scores, dim=0)
+
+    @torch.no_grad()
+    def _contrast_token_weights(self, model, ordered_view, shuffled_view,
+                                completion_ids, completion_mask):
+        if not torch.equal(ordered_view["input_ids"], shuffled_view["input_ids"]):
+            raise ValueError("Contrast RW requires identical ordered/shuffled textual prompt IDs")
+        if not torch.equal(ordered_view["attention_mask"], shuffled_view["attention_mask"]):
+            raise ValueError("Contrast RW requires identical ordered/shuffled prompt masks")
+        # Both scores use the current pre-update policy, identical A and prefixes.
+        # Eval mode removes dropout noise; restore every module's prior mode.
+        modes = [(module, module.training) for module in model.modules()]
+        try:
+            model.eval()
+            ordered = self._score_fixed_completions(model, ordered_view, completion_ids, completion_mask)
+            shuffled = self._score_fixed_completions(model, shuffled_view, completion_ids, completion_mask)
+        finally:
+            for module, training in modes:
+                module.training = training
+        valid = completion_mask.bool()
+        if not torch.isfinite(ordered[valid]).all() or not torch.isfinite(shuffled[valid]).all():
+            raise FloatingPointError("Non-finite valid-token probability in contrast RW")
+        difference = torch.where(valid, (ordered.float() - shuffled.float()).abs(), 0.0)
+        sensitivity = difference / (difference + self.fut_token_sensitivity_tau)
+        weights = 1.0 + (self.fut_token_max_weight - 1.0) * sensitivity
+        self._last_contrast_delta = difference.detach()
+        self._last_contrast_ordered = ordered.detach()
+        self._last_contrast_shuffled = shuffled.detach()
+        return weights.detach()
+
+    @torch.no_grad()
+    def _record_rw_diagnostics(self, weights, completion_ids, mask, advantages,
+                               temporal_gap, is_video, active, example):
+        """Per-rank files: no extra distributed collectives or training signal."""
+        every = int(os.environ.get("TE_RW_DIAGNOSTICS_EVERY", "0"))
+        if every <= 0:
+            return
+        index = getattr(self, "_rw_forward_index", 0) + 1
+        self._rw_forward_index = index
+        if index > 2 and index % every:
+            return
+        valid = mask.bool()
+        applied = weights if active else torch.ones_like(weights)
+        means = (applied * mask).sum(1) / mask.sum(1).clamp_min(1)
+        relative = applied / means[:, None]
+        delta = self._last_contrast_delta
+        values = delta[valid].float()
+        rel = relative[valid].float()
+        rank = int(getattr(self.accelerator, "process_index", 0))
+        record = {
+            "global_step_before_update": int(self.state.global_step),
+            "forward_index": index, "rank": rank, "is_video": bool(is_video),
+            "problem_id": example.get("problem_id"),
+            "gap": float(temporal_gap.item()) if temporal_gap is not None else None,
+            "rw_active": bool(active), "valid_tokens": int(valid.sum().item()),
+            "delta_mean": float(values.mean().item()),
+            "delta_p90": float(torch.quantile(values, 0.9).item()),
+            "candidate_weight_mean": float(weights[valid].mean().item()),
+            "applied_weight_mean": float(applied[valid].mean().item()),
+            "relative_weight_min": float(rel.min().item()),
+            "relative_weight_max": float(rel.max().item()),
+            "relative_weight_std": float(rel.std(unbiased=False).item()),
+            "advantages": advantages.detach().float().cpu().tolist(),
+            "policy_and_kl_both_weighted": True,
+        }
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        with open(os.path.join(self.args.output_dir, f"rw_diagnostics.rank{rank}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        trace_every = int(os.environ.get("TE_RW_TRACE_EVERY", "0"))
+        if is_video and trace_every > 0 and (index <= 2 or index % trace_every == 0):
+            n = min(int(mask[0].sum().item()), int(os.environ.get("TE_RW_TRACE_MAX_TOKENS", "192")))
+            trace = {"global_step_before_update": int(self.state.global_step),
+                     "forward_index": index, "rank": rank, "rw_active": bool(active),
+                     "problem_id": example.get("problem_id"), "gap": record["gap"],
+                     "completion_token_ids": completion_ids[0, :n].detach().cpu().tolist(),
+                     "logp_ordered": self._last_contrast_ordered[0, :n].float().cpu().tolist(),
+                     "logp_shuffled": self._last_contrast_shuffled[0, :n].float().cpu().tolist(),
+                     "applied_weights": applied[0, :n].float().cpu().tolist(),
+                     "relative_weights": relative[0, :n].float().cpu().tolist()}
+            with open(os.path.join(self.args.output_dir, f"rw_tokens.rank{rank}.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(trace, ensure_ascii=False, default=str) + "\n")
+
     def _token_id_set(self, phrases, cache_name):
         if hasattr(self, cache_name):
             return getattr(self, cache_name)
@@ -519,6 +645,14 @@ class Qwen2VLGRPOTrainer(Trainer):
             token_ids.update(int(token_id) for token_id in ids)
         setattr(self, cache_name, token_ids)
         return token_ids
+
+    def _apply_token_rw(self, is_video, temporal_gap):
+        """The RW gate does not depend on TE Rule or bonus magnitude."""
+        return (
+            self.temporal and self.fut_token_weighting and is_video
+            and (self.fut_token_weighting_scope == "all_video"
+                 or (temporal_gap is not None and temporal_gap.detach().item() > 0.0))
+        )
 
     def _temporal_evidence_token_weights(self, completion_ids, completion_mask):
         temporal_phrases = [
@@ -578,6 +712,8 @@ class Qwen2VLGRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
+        if len(inputs) != 1:
+            raise ValueError("This video trainer requires per-device prompt batch size 1")
     
         
 
@@ -650,8 +786,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         corrupted_prompt_inputs["attention_mask"] = corrupted_prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
                     corrupted_prompt_inputs_list.append(corrupted_prompt_inputs)
             else:
-                indices = torch.randperm(video_inputs[0].size(0))
-                shuffled_video_inputs = [video_inputs[0][indices]]
+                shuffled_video_inputs = [self._corrupt_video_tensor(video_inputs[0], "shuffle")]
                 shuffled_prompt_inputs = self.processing_class(
                     text=copy.deepcopy(prompts_text),
                     images=image_inputs,
@@ -666,6 +801,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                 if self.max_prompt_length is not None:
                     shuffled_prompt_ids = shuffled_prompt_ids[:, -self.max_prompt_length :]
                     shuffled_prompt_mask = shuffled_prompt_mask[:, -self.max_prompt_length :]
+                    shuffled_prompt_inputs["input_ids"] = shuffled_prompt_ids
+                    shuffled_prompt_inputs["attention_mask"] = shuffled_prompt_mask
         
         
         # Generate completions
@@ -720,6 +857,19 @@ class Qwen2VLGRPOTrainer(Trainer):
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
+        contrast_weights = None
+        if self.temporal and self.fut_token_weighting and self.fut_token_weighting_method == "contrast":
+            # Execute the same 2*G scoring calls on EVERY rank, including images
+            # and non-positive groups, to avoid rank-local ZeRO forward schedules.
+            # Images use the same view twice and retain uniform loss weights.
+            scoring_view = prompt_inputs
+            if video_inputs:
+                scoring_view = (corrupted_prompt_inputs_list[0] if self.fut_grpo
+                                else shuffled_prompt_inputs)
+            contrast_weights = self._contrast_token_weights(
+                model, prompt_inputs, scoring_view, completion_ids, completion_mask
+            )
+
         # Concatenate prompt_mask with completion_mask for logit computation
         # attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
         # pixel_values = prompt_inputs["pixel_values"].repeat(self.num_generations, 1)
@@ -729,6 +879,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         prompt_inputs.pop("input_ids")
         prompt_inputs.pop("attention_mask")
+        prompt_inputs["attention_mask"] = torch.cat([prompt_mask, completion_mask], dim=1)
         
         if inputs[0]['data_type'] == 'image':
             prompt_inputs["pixel_values"] = prompt_inputs["pixel_values"].repeat(len(prompt_completion_ids), 1)
@@ -746,13 +897,9 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         
         
-        try:
-            per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
-            per_token_logps = per_token_logps[:, prompt_length - 1 :]
-        except Exception as e:
-            print(f"Error computing per_token_logps: {e}. Setting output to zero.")
-            # per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device, requires_grad=True)
-            per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
+        # Fail visibly rather than silently retrying without visual evidence.
+        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
+        per_token_logps = per_token_logps[:, prompt_length - 1 :]
         
         with torch.inference_mode():
             try:
@@ -763,11 +910,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
             except Exception as e:
-                print(f"Error computing ref_per_token_logps: {e}. Setting output to zero.")
-                # ref_per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device)
-                with self.accelerator.unwrap_model(model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
-                ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
+                raise RuntimeError("Reference scoring failed; refusing to retry without visual inputs") from e
 
         # Compute the KL divergence between the model and the reference model
         
@@ -776,6 +919,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         corrupted_rewards_per_func = None
         temporal_bonus = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_gap = None
         if self.temporal and video_inputs:
             if self.fut_grpo:
                 corrupted_completions = self.processing_class.batch_decode(corrupted_completion_ids, skip_special_tokens=True)
@@ -848,21 +992,23 @@ class Qwen2VLGRPOTrainer(Trainer):
                 else:
                     corrupted_acc_mean = torch.zeros_like(acc_mean)
                 temporal_gap = acc_mean - corrupted_acc_mean
-                effective_gap = temporal_gap - self.fut_gap_threshold
                 if self.fut_temporal_margin > 0:
-                    bonus_scale = torch.clamp(effective_gap / self.fut_temporal_margin, min=0.0, max=1.0)
+                    bonus_scale = torch.clamp(
+                        temporal_gap / self.fut_temporal_margin, min=0.0, max=1.0
+                    )
                 else:
-                    bonus_scale = (effective_gap > 0).to(acc_mean.dtype)
+                    bonus_scale = (temporal_gap > 0).to(acc_mean.dtype)
                 temporal_bonus = self.fut_temporal_alpha * bonus_scale
-                mask = temporal_rewards_per_func[:, 0] > self.fut_min_correct_reward
+                mask = temporal_rewards_per_func[:, 0] > 0.0
                 temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + temporal_bonus
                 temporal_rewards = temporal_bonus.detach().reshape(1).to(device)
                 self._metrics["fut/corrupted_accuracy"].append(corrupted_acc_mean.detach().item())
                 self._metrics["fut/temporal_gap"].append(temporal_gap.detach().item())
                 self._metrics["fut/temporal_bonus"].append(temporal_bonus.detach().item())
-                self._metrics["fut/selective_activation"].append(float(temporal_bonus.detach().item() > 0.0))
+                self._metrics["fut/selective_activation"].append(float(temporal_gap.detach().item() > 0.0))
             else:
                 shuffled_acc_mean = shuffled_rewards_per_func[:, 0].mean()
+                temporal_gap = acc_mean - shuffled_acc_mean
                 if acc_mean >= 0.8 * shuffled_acc_mean:
                     mask = temporal_rewards_per_func[:, 0] > 0.1
                     temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
@@ -922,31 +1068,29 @@ class Qwen2VLGRPOTrainer(Trainer):
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         # per_token_loss = -per_token_loss
-        token_weighting_active = False
-        if self.fut_grpo and self.fut_token_weighting and bool(video_inputs):
-            if self.fut_token_weighting_scope == "all_video":
-                token_weighting_active = True
-            elif self.fut_token_weighting_scope == "positive_gap":
-                token_weighting_active = temporal_gap.detach().item() > 0.0
-            else:  # selective: preserve the reliable-gap activation used by the full method.
-                token_weighting_active = temporal_bonus.detach().item() > 0.0
-
-        if token_weighting_active:
-            token_weights = self._temporal_evidence_token_weights(completion_ids, completion_mask)
+        apply_token_weighting = self._apply_token_rw(bool(video_inputs), temporal_gap)
+        if apply_token_weighting:
+            token_weights = (contrast_weights if self.fut_token_weighting_method == "contrast"
+                             else self._temporal_evidence_token_weights(completion_ids, completion_mask))
             weighted_mask = completion_mask * token_weights
             loss = ((per_token_loss * weighted_mask).sum(dim=1) / weighted_mask.sum(dim=1).clamp_min(1.0)).mean()
             mean_token_weight = (token_weights * completion_mask).sum() / completion_mask.sum().clamp_min(1)
         else:
             loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-            if self.fut_grpo and self.fut_token_weighting:
+            if self.fut_token_weighting:
                 mean_token_weight = completion_mask.new_tensor(1.0, dtype=torch.float32)
 
+        if contrast_weights is not None:
+            self._record_rw_diagnostics(
+                contrast_weights, completion_ids, completion_mask, advantages,
+                temporal_gap, bool(video_inputs), apply_token_weighting, inputs[0]
+            )
+
         # Every distributed rank must execute collectives in the same order.
-        # Selective activation is intentionally rank-local because each rank can
-        # receive a different modality/gap, so gather the active or neutral
-        # weight unconditionally after the branch.
-        if self.fut_grpo and self.fut_token_weighting:
-            self._metrics["fut/token_weighting_activation"].append(float(token_weighting_active))
+        # Token-weight activation is intentionally rank-local because each rank
+        # can receive a different modality/gap. Gather the active or neutral
+        # weight unconditionally after the branch for either scope.
+        if self.fut_token_weighting:
             self._metrics["fut/token_weight"].append(
                 self.accelerator.gather_for_metrics(mean_token_weight).float().mean().item()
             )

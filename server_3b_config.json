@@ -1,0 +1,21 @@
+{
+  "model_path": "/path/to/Qwen2.5-VL-3B-Video-cot-sft",
+  "data_root": "/path/to/Video-R1-data",
+  "dataset_path": "/path/to/Video-R1-260k.filtered.json",
+  "output_root": "/path/to/TE-CGRPO-runs",
+  "cuda_visible_devices": "0,1,3",
+  "seed": 42,
+  "max_steps": 1000,
+  "save_steps": 1000,
+  "max_prompt_length": 4096,
+  "max_completion_length": 192,
+  "max_pixels": 401408,
+  "gradient_accumulation_steps": 1,
+  "alpha": 0.50,
+  "margin": 0.25,
+  "token_max_weight": 1.30,
+  "token_tau": 1.0,
+  "attn_implementation": "flash_attention_2",
+  "diagnostics_every": 1,
+  "token_trace_every": 50
+}
